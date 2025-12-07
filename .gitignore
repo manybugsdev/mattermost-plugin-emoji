@@ -1,0 +1,25 @@
+# Build artifacts
+dist/
+server/plugin-*
+
+# Go artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go vendor directory
+vendor/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
