@@ -1,0 +1,10 @@
+{
+  "id": "com.mattermost.emoji-plugin",
+  "name": "Emoji Plugin",
+  "description": "A simple hello world emoji manager plugin for Mattermost",
+  "version": "0.1.0",
+  "min_server_version": "5.12.0",
+  "server": {
+    "executable": "plugin-linux-amd64"
+  }
+}
