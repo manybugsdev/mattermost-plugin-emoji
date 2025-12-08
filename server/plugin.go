@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 // Plugin implements the interface expected by the Mattermost server to communicate between the server and plugin processes.
 type Plugin struct {
 	plugin.MattermostPlugin
+	httpClient *http.Client
 }
 
 // CustomEmoji represents a custom emoji stored in the plugin's KVStore
@@ -37,6 +39,18 @@ const (
 
 // OnActivate is called when the plugin is activated
 func (p *Plugin) OnActivate() error {
+	// Initialize HTTP client with timeout and security settings
+	p.httpClient = &http.Client{
+		Timeout: httpTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Limit redirects to 10
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
 	if err := p.API.RegisterCommand(&model.Command{
 		Trigger:          "emoji",
 		AutoComplete:     true,
@@ -174,11 +188,8 @@ func (p *Plugin) handleAdd(userID, key, value string) (*model.CommandResponse, *
 			}, nil
 		}
 		
-		// Validate URL is accessible with timeout
-		client := &http.Client{
-			Timeout: httpTimeout,
-		}
-		resp, err := client.Get(value)
+		// Validate URL is accessible
+		resp, err := p.httpClient.Get(value)
 		if err != nil {
 			return &model.CommandResponse{
 				ResponseType: model.CommandResponseTypeEphemeral,
@@ -291,8 +302,20 @@ func validateURL(urlStr string) error {
 		return fmt.Errorf("invalid hostname")
 	}
 
-	// Resolve the hostname to IP addresses
-	ips, err := net.LookupIP(host)
+	// Resolve the hostname to IP addresses with timeout
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: 5 * time.Second,
+			}
+			return d.DialContext(ctx, network, address)
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	ips, err := resolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return fmt.Errorf("failed to resolve hostname: %v", err)
 	}
@@ -381,10 +404,7 @@ func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 			return
 		}
 
-		client := &http.Client{
-			Timeout: httpTimeout,
-		}
-		resp, err := client.Get(emoji.Content)
+		resp, err := p.httpClient.Get(emoji.Content)
 		if err != nil {
 			http.Error(w, "Error fetching emoji image", http.StatusInternalServerError)
 			return
@@ -396,7 +416,10 @@ func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 		
 		// Limit the amount of data read to prevent DoS
 		limitedReader := io.LimitReader(resp.Body, maxImageSize)
-		io.Copy(w, limitedReader)
+		if _, err := io.Copy(w, limitedReader); err != nil {
+			p.API.LogError("Failed to copy emoji image", "error", err.Error())
+			http.Error(w, "Error serving emoji image", http.StatusInternalServerError)
+		}
 		return
 	}
 
