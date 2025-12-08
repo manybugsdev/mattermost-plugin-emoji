@@ -137,7 +137,12 @@ func (p *Plugin) handleList(userID string) (*model.CommandResponse, *model.AppEr
 				continue
 			}
 
-			emojiList = append(emojiList, fmt.Sprintf("* **:%s:** - %s (%s)", emoji.Name, emoji.Content, emoji.Type))
+			// Truncate content for display if it's too long
+			content := emoji.Content
+			if len(content) > 100 {
+				content = content[:97] + "..."
+			}
+			emojiList = append(emojiList, fmt.Sprintf("* **:%s:** - %s (%s)", emoji.Name, content, emoji.Type))
 		}
 	}
 
@@ -373,7 +378,7 @@ func isPrivateIP(ip net.IP) bool {
 	return false
 }
 
-// ServeHTTP demonstrates a plugin that handles HTTP requests
+// ServeHTTP handles HTTP requests for serving custom emoji images and text
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
 	// Extract emoji name from path
 	path := strings.TrimPrefix(r.URL.Path, "/")
@@ -411,14 +416,19 @@ func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 		}
 		defer resp.Body.Close()
 
-		// Copy content type
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, "Error fetching emoji image", http.StatusInternalServerError)
+			return
+		}
+
+		// Set content type header before writing any data
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 		
-		// Limit the amount of data read to prevent DoS
+		// Limit the amount of data read to prevent DoS and write to response
 		limitedReader := io.LimitReader(resp.Body, maxImageSize)
 		if _, err := io.Copy(w, limitedReader); err != nil {
+			// Log error but can't send HTTP error as headers are already sent
 			p.API.LogError("Failed to copy emoji image", "error", err.Error())
-			http.Error(w, "Error serving emoji image", http.StatusInternalServerError)
 		}
 		return
 	}
