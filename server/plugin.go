@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/mattermost/mattermost-server/v6/model"
 	"github.com/mattermost/mattermost-server/v6/plugin"
@@ -26,7 +29,10 @@ type CustomEmoji struct {
 }
 
 const (
-	emojiKeyPrefix = "emoji_"
+	emojiKeyPrefix      = "emoji_"
+	httpTimeout         = 10 * time.Second
+	maxImageSize        = 5 * 1024 * 1024 // 5MB
+	maxKVListSize       = 1000
 )
 
 // OnActivate is called when the plugin is activated
@@ -96,7 +102,7 @@ func (p *Plugin) respondWithHelp() *model.CommandResponse {
 
 // handleList lists all custom emoji
 func (p *Plugin) handleList(userID string) (*model.CommandResponse, *model.AppError) {
-	keys, err := p.API.KVList(0, 1000)
+	keys, err := p.API.KVList(0, maxKVListSize)
 	if err != nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
@@ -160,8 +166,19 @@ func (p *Plugin) handleAdd(userID, key, value string) (*model.CommandResponse, *
 	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
 		emojiType = "url"
 		
-		// Validate URL is accessible
-		resp, err := http.Get(value)
+		// Validate URL to prevent SSRF attacks
+		if err := validateURL(value); err != nil {
+			return &model.CommandResponse{
+				ResponseType: model.CommandResponseTypeEphemeral,
+				Text:         "Invalid URL: " + err.Error(),
+			}, nil
+		}
+		
+		// Validate URL is accessible with timeout
+		client := &http.Client{
+			Timeout: httpTimeout,
+		}
+		resp, err := client.Get(value)
 		if err != nil {
 			return &model.CommandResponse{
 				ResponseType: model.CommandResponseTypeEphemeral,
@@ -256,6 +273,83 @@ func isValidEmojiName(name string) bool {
 	return true
 }
 
+// validateURL checks if a URL is valid and not pointing to internal/private networks
+func validateURL(urlStr string) error {
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		return fmt.Errorf("invalid URL format: %v", err)
+	}
+
+	// Only allow http and https schemes
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return fmt.Errorf("only http and https schemes are allowed")
+	}
+
+	// Check if hostname resolves to a private IP
+	host := parsedURL.Hostname()
+	if host == "" {
+		return fmt.Errorf("invalid hostname")
+	}
+
+	// Resolve the hostname to IP addresses
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("failed to resolve hostname: %v", err)
+	}
+
+	// Check if any resolved IP is private
+	for _, ip := range ips {
+		if isPrivateIP(ip) {
+			return fmt.Errorf("URLs pointing to private/internal networks are not allowed")
+		}
+	}
+
+	return nil
+}
+
+// isPrivateIP checks if an IP address is private, loopback, or link-local
+func isPrivateIP(ip net.IP) bool {
+	// Check for loopback addresses
+	if ip.IsLoopback() {
+		return true
+	}
+
+	// Check for link-local addresses
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+
+	// Check for private IPv4 ranges
+	if ip4 := ip.To4(); ip4 != nil {
+		// 10.0.0.0/8
+		if ip4[0] == 10 {
+			return true
+		}
+		// 172.16.0.0/12
+		if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+			return true
+		}
+		// 192.168.0.0/16
+		if ip4[0] == 192 && ip4[1] == 168 {
+			return true
+		}
+		// 169.254.0.0/16 (link-local)
+		if ip4[0] == 169 && ip4[1] == 254 {
+			return true
+		}
+	}
+
+	// Check for private IPv6 ranges
+	if ip.To4() == nil {
+		// fc00::/7 (Unique Local Addresses)
+		if len(ip) >= 1 && (ip[0]&0xfe) == 0xfc {
+			return true
+		}
+	}
+
+	return false
+}
+
 // ServeHTTP demonstrates a plugin that handles HTTP requests
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
 	// Extract emoji name from path
@@ -281,7 +375,16 @@ func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 
 	// If emoji is a URL, fetch and return the image
 	if emoji.Type == "url" {
-		resp, err := http.Get(emoji.Content)
+		// Validate URL before fetching
+		if err := validateURL(emoji.Content); err != nil {
+			http.Error(w, "Invalid emoji URL", http.StatusBadRequest)
+			return
+		}
+
+		client := &http.Client{
+			Timeout: httpTimeout,
+		}
+		resp, err := client.Get(emoji.Content)
 		if err != nil {
 			http.Error(w, "Error fetching emoji image", http.StatusInternalServerError)
 			return
@@ -290,7 +393,10 @@ func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 
 		// Copy content type
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-		io.Copy(w, resp.Body)
+		
+		// Limit the amount of data read to prevent DoS
+		limitedReader := io.LimitReader(resp.Body, maxImageSize)
+		io.Copy(w, limitedReader)
 		return
 	}
 
