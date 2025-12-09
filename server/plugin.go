@@ -21,8 +21,9 @@ type Plugin struct {
 }
 
 const (
-	httpTimeout  = 10 * time.Second
-	maxImageSize = 5 * 1024 * 1024 // 5MB
+	httpTimeout     = 10 * time.Second
+	maxImageSize    = 5 * 1024 * 1024 // 5MB
+	maxEmojiPerPage = 200              // Maximum number of emoji to list per page
 )
 
 // OnActivate is called when the plugin is activated
@@ -104,7 +105,7 @@ func (p *Plugin) respondWithHelp() *model.CommandResponse {
 // handleList lists all custom emoji
 func (p *Plugin) handleList(userID string) (*model.CommandResponse, *model.AppError) {
 	// Get all custom emoji using the plugin API
-	emojiList, err := p.API.GetEmojiList("name", 0, 200)
+	emojiList, err := p.API.GetEmojiList("name", 0, maxEmojiPerPage)
 	if err != nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
@@ -194,26 +195,14 @@ func (p *Plugin) handleAdd(c *plugin.Context, userID, name, imageURL string) (*m
 		}, nil
 	}
 
-	// Get site URL and create API client
-	config := p.API.GetConfig()
-	if config.ServiceSettings.SiteURL == nil {
+	// Create API client with user's session
+	client, err := p.createAPIClient(c)
+	if err != nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Error: Site URL is not configured",
+			Text:         "Error: " + err.Error(),
 		}, nil
 	}
-
-	client := model.NewAPIv4Client(*config.ServiceSettings.SiteURL)
-	
-	// Get the session token from context
-	session, appErr := p.API.GetSession(c.SessionId)
-	if appErr != nil {
-		return &model.CommandResponse{
-			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Error getting user session: " + appErr.Error(),
-		}, nil
-	}
-	client.SetToken(session.Token)
 
 	// Determine filename from content type
 	filename := name
@@ -258,33 +247,21 @@ func (p *Plugin) handleRemove(c *plugin.Context, userID, name string) (*model.Co
 		}, nil
 	}
 
-	// Get site URL and create API client
-	config := p.API.GetConfig()
-	if config.ServiceSettings.SiteURL == nil {
-		return &model.CommandResponse{
-			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Error: Site URL is not configured",
-		}, nil
-	}
-
-	client := model.NewAPIv4Client(*config.ServiceSettings.SiteURL)
-	
-	// Get the session token from context
-	session, appErr := p.API.GetSession(c.SessionId)
-	if appErr != nil {
-		return &model.CommandResponse{
-			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Error getting user session: " + appErr.Error(),
-		}, nil
-	}
-	client.SetToken(session.Token)
-
-	// Delete the emoji
-	_, err := client.DeleteEmoji(emoji.Id)
+	// Create API client with user's session
+	client, err := p.createAPIClient(c)
 	if err != nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Failed to delete emoji: " + err.Error(),
+			Text:         "Error: " + err.Error(),
+		}, nil
+	}
+
+	// Delete the emoji
+	_, deleteErr := client.DeleteEmoji(emoji.Id)
+	if deleteErr != nil {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         "Failed to delete emoji: " + deleteErr.Error(),
 		}, nil
 	}
 
@@ -292,6 +269,27 @@ func (p *Plugin) handleRemove(c *plugin.Context, userID, name string) (*model.Co
 		ResponseType: model.CommandResponseTypeEphemeral,
 		Text:         fmt.Sprintf("Successfully removed emoji `:%s:`", name),
 	}, nil
+}
+
+// createAPIClient creates and configures an API client with the user's session token
+func (p *Plugin) createAPIClient(c *plugin.Context) (*model.Client4, error) {
+	// Get site URL
+	config := p.API.GetConfig()
+	if config.ServiceSettings.SiteURL == nil {
+		return nil, fmt.Errorf("site URL is not configured")
+	}
+
+	// Create API client
+	client := model.NewAPIv4Client(*config.ServiceSettings.SiteURL)
+
+	// Get the session token from context
+	session, appErr := p.API.GetSession(c.SessionId)
+	if appErr != nil {
+		return nil, fmt.Errorf("error getting user session: %s", appErr.Error())
+	}
+	client.SetToken(session.Token)
+
+	return client, nil
 }
 
 // isValidEmojiName checks if an emoji name is valid
