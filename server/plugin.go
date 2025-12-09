@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -21,20 +20,9 @@ type Plugin struct {
 	httpClient *http.Client
 }
 
-// CustomEmoji represents a custom emoji stored in the plugin's KVStore
-type CustomEmoji struct {
-	Name      string `json:"name"`
-	Content   string `json:"content"`
-	Type      string `json:"type"` // "url" or "text"
-	CreatorID string `json:"creator_id"`
-	CreatedAt int64  `json:"created_at"`
-}
-
 const (
-	emojiKeyPrefix      = "emoji_"
-	httpTimeout         = 10 * time.Second
-	maxImageSize        = 5 * 1024 * 1024 // 5MB
-	maxKVListSize       = 1000
+	httpTimeout  = 10 * time.Second
+	maxImageSize = 5 * 1024 * 1024 // 5MB
 )
 
 // OnActivate is called when the plugin is activated
@@ -80,21 +68,21 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 		if len(split) < 4 {
 			return &model.CommandResponse{
 				ResponseType: model.CommandResponseTypeEphemeral,
-				Text:         "Usage: `/emoji add [key] [URL or text]`",
+				Text:         "Usage: `/emoji add [name] [image URL]`",
 			}, nil
 		}
-		key := split[2]
-		value := strings.Join(split[3:], " ")
-		return p.handleAdd(args.UserId, key, value)
+		name := split[2]
+		imageURL := split[3]
+		return p.handleAdd(c, args.UserId, name, imageURL)
 	case "rm":
 		if len(split) < 3 {
 			return &model.CommandResponse{
 				ResponseType: model.CommandResponseTypeEphemeral,
-				Text:         "Usage: `/emoji rm [key]`",
+				Text:         "Usage: `/emoji rm [name]`",
 			}, nil
 		}
-		key := split[2]
-		return p.handleRemove(args.UserId, key)
+		name := split[2]
+		return p.handleRemove(c, args.UserId, name)
 	default:
 		return p.respondWithHelp(), nil
 	}
@@ -104,9 +92,8 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 func (p *Plugin) respondWithHelp() *model.CommandResponse {
 	helpText := `#### Emoji Manager Commands
 * **/emoji ls** - Show all custom emoji
-* **/emoji add [key] [URL]** - Add emoji from image URL
-* **/emoji add [key] [text]** - Add emoji from text
-* **/emoji rm [key]** - Remove emoji`
+* **/emoji add [name] [image URL]** - Add emoji from image URL
+* **/emoji rm [name]** - Remove emoji`
 
 	return &model.CommandResponse{
 		ResponseType: model.CommandResponseTypeEphemeral,
@@ -116,7 +103,8 @@ func (p *Plugin) respondWithHelp() *model.CommandResponse {
 
 // handleList lists all custom emoji
 func (p *Plugin) handleList(userID string) (*model.CommandResponse, *model.AppError) {
-	keys, err := p.API.KVList(0, maxKVListSize)
+	// Get all custom emoji using the plugin API
+	emojiList, err := p.API.GetEmojiList("name", 0, 200)
 	if err != nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
@@ -124,46 +112,29 @@ func (p *Plugin) handleList(userID string) (*model.CommandResponse, *model.AppEr
 		}, nil
 	}
 
-	var emojiList []string
-	for _, key := range keys {
-		if strings.HasPrefix(key, emojiKeyPrefix) {
-			data, err := p.API.KVGet(key)
-			if err != nil {
-				continue
-			}
-
-			var emoji CustomEmoji
-			if err := json.Unmarshal(data, &emoji); err != nil {
-				continue
-			}
-
-			// Truncate content for display if it's too long
-			content := emoji.Content
-			if len(content) > 100 {
-				content = content[:97] + "..."
-			}
-			emojiList = append(emojiList, fmt.Sprintf("* **:%s:** - %s (%s)", emoji.Name, content, emoji.Type))
-		}
-	}
-
 	if len(emojiList) == 0 {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "No custom emoji found. Use `/emoji add [key] [URL or text]` to add one.",
+			Text:         "No custom emoji found. Use `/emoji add [name] [URL]` to add one.",
 		}, nil
 	}
 
-	text := "#### Custom Emoji\n" + strings.Join(emojiList, "\n")
+	var lines []string
+	for _, emoji := range emojiList {
+		lines = append(lines, fmt.Sprintf("* **:%s:** (ID: %s)", emoji.Name, emoji.Id))
+	}
+
+	text := "#### Custom Emoji\n" + strings.Join(lines, "\n")
 	return &model.CommandResponse{
 		ResponseType: model.CommandResponseTypeEphemeral,
 		Text:         text,
 	}, nil
 }
 
-// handleAdd adds a new custom emoji
-func (p *Plugin) handleAdd(userID, key, value string) (*model.CommandResponse, *model.AppError) {
-	// Validate emoji key
-	if !isValidEmojiName(key) {
+// handleAdd adds a new custom emoji from an image URL
+func (p *Plugin) handleAdd(c *plugin.Context, userID, name, imageURL string) (*model.CommandResponse, *model.AppError) {
+	// Validate emoji name
+	if !isValidEmojiName(name) {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
 			Text:         "Invalid emoji name. Emoji names must contain only letters, numbers, hyphens, and underscores.",
@@ -171,107 +142,155 @@ func (p *Plugin) handleAdd(userID, key, value string) (*model.CommandResponse, *
 	}
 
 	// Check if emoji already exists
-	existingKey := emojiKeyPrefix + key
-	existingData, _ := p.API.KVGet(existingKey)
-	if existingData != nil {
+	existing, _ := p.API.GetEmojiByName(name)
+	if existing != nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         fmt.Sprintf("Emoji `:%s:` already exists. Use `/emoji rm %s` to remove it first.", key, key),
+			Text:         fmt.Sprintf("Emoji `:%s:` already exists. Use `/emoji rm %s` to remove it first.", name, name),
 		}, nil
 	}
 
-	// Determine if value is URL or text
-	emojiType := "text"
-	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
-		emojiType = "url"
-		
-		// Validate URL to prevent SSRF attacks
-		if err := validateURL(value); err != nil {
-			return &model.CommandResponse{
-				ResponseType: model.CommandResponseTypeEphemeral,
-				Text:         "Invalid URL: " + err.Error(),
-			}, nil
-		}
-		
-		// Validate URL is accessible
-		resp, err := p.httpClient.Get(value)
-		if err != nil {
-			return &model.CommandResponse{
-				ResponseType: model.CommandResponseTypeEphemeral,
-				Text:         "Failed to access URL: " + err.Error(),
-			}, nil
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return &model.CommandResponse{
-				ResponseType: model.CommandResponseTypeEphemeral,
-				Text:         fmt.Sprintf("URL returned status code: %d", resp.StatusCode),
-			}, nil
-		}
-
-		// Check if content type is an image
-		contentType := resp.Header.Get("Content-Type")
-		if !strings.HasPrefix(contentType, "image/") {
-			return &model.CommandResponse{
-				ResponseType: model.CommandResponseTypeEphemeral,
-				Text:         "URL must point to an image file.",
-			}, nil
-		}
+	// Validate URL to prevent SSRF attacks
+	if err := validateURL(imageURL); err != nil {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         "Invalid URL: " + err.Error(),
+		}, nil
 	}
 
-	// Create custom emoji
-	emoji := CustomEmoji{
-		Name:      key,
-		Content:   value,
-		Type:      emojiType,
-		CreatorID: userID,
-		CreatedAt: model.GetMillis(),
-	}
-
-	// Save to KVStore
-	data, err := json.Marshal(emoji)
+	// Download the image from URL
+	resp, err := p.httpClient.Get(imageURL)
 	if err != nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Error saving emoji: " + err.Error(),
+			Text:         "Failed to access URL: " + err.Error(),
+		}, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         fmt.Sprintf("URL returned status code: %d", resp.StatusCode),
 		}, nil
 	}
 
-	if err := p.API.KVSet(existingKey, data); err != nil {
+	// Check if content type is an image
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "image/") {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Error saving emoji: " + err.Error(),
+			Text:         "URL must point to an image file.",
+		}, nil
+	}
+
+	// Read image data with size limit
+	limitedReader := io.LimitReader(resp.Body, maxImageSize)
+	imageData, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         "Failed to download image: " + err.Error(),
+		}, nil
+	}
+
+	// Get site URL and create API client
+	config := p.API.GetConfig()
+	if config.ServiceSettings.SiteURL == nil {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         "Error: Site URL is not configured",
+		}, nil
+	}
+
+	client := model.NewAPIv4Client(*config.ServiceSettings.SiteURL)
+	
+	// Get the session token from context
+	session, appErr := p.API.GetSession(c.SessionId)
+	if appErr != nil {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         "Error getting user session: " + appErr.Error(),
+		}, nil
+	}
+	client.SetToken(session.Token)
+
+	// Determine filename from content type
+	filename := name
+	if strings.Contains(contentType, "png") {
+		filename += ".png"
+	} else if strings.Contains(contentType, "jpeg") || strings.Contains(contentType, "jpg") {
+		filename += ".jpg"
+	} else if strings.Contains(contentType, "gif") {
+		filename += ".gif"
+	} else {
+		filename += ".png" // default
+	}
+
+	// Create the emoji
+	emoji := &model.Emoji{
+		CreatorId: userID,
+		Name:      name,
+	}
+
+	createdEmoji, _, err := client.CreateEmoji(emoji, imageData, filename)
+	if err != nil {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         "Failed to create emoji: " + err.Error(),
 		}, nil
 	}
 
 	return &model.CommandResponse{
 		ResponseType: model.CommandResponseTypeEphemeral,
-		Text:         fmt.Sprintf("Successfully added emoji `:%s:` (%s)", key, emojiType),
+		Text:         fmt.Sprintf("Successfully added emoji `:%s:` (ID: %s)", createdEmoji.Name, createdEmoji.Id),
 	}, nil
 }
 
 // handleRemove removes a custom emoji
-func (p *Plugin) handleRemove(userID, key string) (*model.CommandResponse, *model.AppError) {
-	emojiKey := emojiKeyPrefix + key
-	data, err := p.API.KVGet(emojiKey)
-	if err != nil || data == nil {
+func (p *Plugin) handleRemove(c *plugin.Context, userID, name string) (*model.CommandResponse, *model.AppError) {
+	// Get the emoji by name
+	emoji, appErr := p.API.GetEmojiByName(name)
+	if appErr != nil || emoji == nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         fmt.Sprintf("Emoji `:%s:` not found.", key),
+			Text:         fmt.Sprintf("Emoji `:%s:` not found.", name),
 		}, nil
 	}
 
-	if err := p.API.KVDelete(emojiKey); err != nil {
+	// Get site URL and create API client
+	config := p.API.GetConfig()
+	if config.ServiceSettings.SiteURL == nil {
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Error removing emoji: " + err.Error(),
+			Text:         "Error: Site URL is not configured",
+		}, nil
+	}
+
+	client := model.NewAPIv4Client(*config.ServiceSettings.SiteURL)
+	
+	// Get the session token from context
+	session, appErr := p.API.GetSession(c.SessionId)
+	if appErr != nil {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         "Error getting user session: " + appErr.Error(),
+		}, nil
+	}
+	client.SetToken(session.Token)
+
+	// Delete the emoji
+	_, err := client.DeleteEmoji(emoji.Id)
+	if err != nil {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         "Failed to delete emoji: " + err.Error(),
 		}, nil
 	}
 
 	return &model.CommandResponse{
 		ResponseType: model.CommandResponseTypeEphemeral,
-		Text:         fmt.Sprintf("Successfully removed emoji `:%s:`", key),
+		Text:         fmt.Sprintf("Successfully removed emoji `:%s:`", name),
 	}, nil
 }
 
@@ -378,64 +397,9 @@ func isPrivateIP(ip net.IP) bool {
 	return false
 }
 
-// ServeHTTP handles HTTP requests for serving custom emoji images and text
+// ServeHTTP handles HTTP requests
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
-	// Extract emoji name from path
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	if path == "" {
-		fmt.Fprint(w, "Emoji Plugin - Use /emoji command to manage custom emoji")
-		return
-	}
-
-	// Get emoji from KVStore
-	emojiKey := emojiKeyPrefix + path
-	data, err := p.API.KVGet(emojiKey)
-	if err != nil || data == nil {
-		http.Error(w, "Emoji not found", http.StatusNotFound)
-		return
-	}
-
-	var emoji CustomEmoji
-	if err := json.Unmarshal(data, &emoji); err != nil {
-		http.Error(w, "Error parsing emoji data", http.StatusInternalServerError)
-		return
-	}
-
-	// If emoji is a URL, fetch and return the image
-	if emoji.Type == "url" {
-		// Validate URL before fetching
-		if err := validateURL(emoji.Content); err != nil {
-			http.Error(w, "Invalid emoji URL", http.StatusBadRequest)
-			return
-		}
-
-		resp, err := p.httpClient.Get(emoji.Content)
-		if err != nil {
-			http.Error(w, "Error fetching emoji image", http.StatusInternalServerError)
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			http.Error(w, "Error fetching emoji image", http.StatusInternalServerError)
-			return
-		}
-
-		// Set content type header before writing any data
-		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-		
-		// Limit the amount of data read to prevent DoS and write to response
-		limitedReader := io.LimitReader(resp.Body, maxImageSize)
-		if _, err := io.Copy(w, limitedReader); err != nil {
-			// Log error but can't send HTTP error as headers are already sent
-			p.API.LogError("Failed to copy emoji image", "error", err.Error())
-		}
-		return
-	}
-
-	// Otherwise return text representation
-	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprint(w, emoji.Content)
+	fmt.Fprint(w, "Emoji Plugin - Use /emoji command to manage custom emoji")
 }
 
 func main() {

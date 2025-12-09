@@ -4,7 +4,7 @@ A comprehensive emoji manager plugin for Mattermost that allows users to manage 
 
 ## Description
 
-This plugin provides a `/emoji` slash command that enables users to add, list, and remove custom emoji stored in the plugin's key-value store. Emoji can be added from image URLs or as text representations.
+This plugin provides a `/emoji` slash command that enables users to add, list, and remove custom emoji using Mattermost's native emoji system. Emoji are added from image URLs and stored in Mattermost's database.
 
 ## Installation
 
@@ -54,29 +54,24 @@ Once installed and enabled, use the `/emoji` slash command to manage custom emoj
   ```
   /emoji ls
   ```
-  Shows all custom emoji stored in the plugin with their names, content, and types.
+  Shows all custom emoji in the Mattermost server with their names and IDs.
 
-- **`/emoji add [key] [URL]`** - Add emoji from an image URL
+- **`/emoji add [name] [image URL]`** - Add emoji from an image URL
   ```
   /emoji add myemoji https://example.com/image.png
   ```
-  Adds a custom emoji from an image URL. The URL must be accessible and point to a valid image file.
+  Adds a custom emoji from an image URL. The URL must be accessible and point to a valid image file (PNG, JPG, or GIF).
+  The emoji name should not include colons (e.g., use `myemoji` not `:myemoji:`).
 
-- **`/emoji add [key] [text]`** - Add emoji from text
-  ```
-  /emoji add textmoji Hello World!
-  ```
-  Adds a custom emoji with a text representation.
-
-- **`/emoji rm [key]`** - Remove an emoji
+- **`/emoji rm [name]`** - Remove an emoji
   ```
   /emoji rm myemoji
   ```
-  Removes the specified custom emoji.
+  Removes the specified custom emoji from Mattermost.
 
 ### Features
 
-- **KVStore Storage**: Custom emoji are stored in the plugin's key-value store
+- **Native Mattermost Integration**: Uses Mattermost's built-in emoji system for storage and management
 - **URL Validation**: Image URLs are validated to ensure they're accessible and point to valid images
 - **SSRF Protection**: URLs are checked to prevent access to internal/private networks
 - **Input Validation**: Emoji names must contain only letters, numbers, hyphens, and underscores
@@ -85,7 +80,7 @@ Once installed and enabled, use the `/emoji` slash command to manage custom emoj
   - DNS timeouts (5s) to prevent DNS rebinding attacks
   - Image size limit (5MB) to prevent DoS attacks
   - Redirect limit (max 10) to prevent redirect loops
-- **HTTP Endpoint**: Serves emoji images via HTTP at `/plugins/com.mattermost.emoji-plugin/[emoji-name]`
+- **User Session Management**: Uses the user's session to create/delete emoji with proper permissions
 
 ### Testing
 
@@ -94,10 +89,7 @@ The plugin's HTTP endpoint is available at:
 http://your-mattermost-server/plugins/com.mattermost.emoji-plugin
 ```
 
-Individual emoji can be accessed at:
-```
-http://your-mattermost-server/plugins/com.mattermost.emoji-plugin/[emoji-name]
-```
+Custom emoji added through the plugin will be available system-wide and can be used in any message with the `:emoji-name:` syntax.
 
 ## Structure
 
